@@ -23,12 +23,14 @@ limitations under the License.
 #include <unordered_set>
 #include <vector>
 
+#include "tensorflow/core/common_runtime/costmodel_manager.h"
 #include "tensorflow/core/common_runtime/device_mgr.h"
 #include "tensorflow/core/common_runtime/device_set.h"
 #include "tensorflow/core/common_runtime/executor.h"
 #include "tensorflow/core/common_runtime/rendezvous_mgr.h"
 #include "tensorflow/core/framework/cancellation.h"
 #include "tensorflow/core/framework/graph.pb.h"
+#include "tensorflow/core/framework/session_state.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
@@ -40,6 +42,7 @@ limitations under the License.
 
 namespace tensorflow {
 
+class CostModel;
 class Device;
 class ThreadPool;
 
@@ -77,7 +80,13 @@ class DirectSession : public Session {
   ::tensorflow::Status PRun(const string& handle, const NamedTensorList& inputs,
                             const std::vector<string>& output_names,
                             std::vector<Tensor>* outputs) override;
+
   ::tensorflow::Status Close() override;
+
+  // This is mainly for testing/debugging.
+  gtl::iterator_range<CostModelManager::CostModelMapIter> CostModels() {
+    return cost_model_manager_.CostModels();
+  }
 
  private:
   typedef DirectSession ME;
@@ -124,9 +133,11 @@ class DirectSession : public Session {
     mutex mu_;
     Status status GUARDED_BY(mu_);
     IntraProcessRendezvous* rendez = nullptr;
+    StepStatsCollector* collector = nullptr;
     Notification executors_done;
     std::unordered_set<string> pending_inputs;
     std::unordered_set<string> pending_outputs;
+    TensorStore tensor_store;
 
     RunState(const std::vector<string>& input_names,
              const std::vector<string>& output_names) {
@@ -139,15 +150,7 @@ class DirectSession : public Session {
       }
     }
 
-    ~RunState() {
-      if (rendez != nullptr) {
-        if (!executors_done.HasBeenNotified()) {
-          rendez->StartAbort(errors::Cancelled("PRun cancellation"));
-          executors_done.WaitForNotification();
-        }
-        rendez->Unref();
-      }
-    }
+    ~RunState();
   };
 
   struct RunStateArgs {
@@ -229,6 +232,9 @@ class DirectSession : public Session {
   std::unordered_map<string, RunState*> partial_runs_
       GUARDED_BY(executor_lock_);
 
+  // This holds all the tensors that are currently alive in the session.
+  SessionState session_state_;
+
   CancellationManager* cancellation_manager_;
 
   // Saves and restores device placements for stateful nodes.
@@ -249,6 +255,9 @@ class DirectSession : public Session {
 
   // Global timeout for all blocking operations in this session.
   const int64 operation_timeout_in_ms_ = 0;
+
+  // Manages all the cost models for the graphs executed in this session.
+  CostModelManager cost_model_manager_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(DirectSession);
 };
